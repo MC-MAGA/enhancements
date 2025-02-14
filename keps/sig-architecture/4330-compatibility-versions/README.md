@@ -90,10 +90,14 @@ tags, and then generate with `hack/update-toc.sh`.
   - [Changes to Feature Gates](#changes-to-feature-gates)
     - [Feature Gate Lifecycles](#feature-gate-lifecycles)
     - [Feature gating changes](#feature-gating-changes)
+    - [Non-Emulatable Features](#non-emulatable-features)
+      - [Alternatives](#alternatives)
   - [Validation ratcheting](#validation-ratcheting)
     - [CEL Environment Compatibility Versioning](#cel-environment-compatibility-versioning)
   - [StorageVersion Compatibility Versioning](#storageversion-compatibility-versioning)
   - [API availability](#api-availability)
+    - [API availability in forward-compatible mode](#api-availability-in-forward-compatible-mode)
+    - [Alternatives to API forward compatibility](#alternatives-to-api-forward-compatibility)
   - [API Field availability](#api-field-availability)
   - [Discovery](#discovery)
   - [Version introspection](#version-introspection)
@@ -126,7 +130,7 @@ tags, and then generate with `hack/update-toc.sh`.
   - [Troubleshooting](#troubleshooting)
 - [Implementation History](#implementation-history)
 - [Drawbacks](#drawbacks)
-- [Alternatives](#alternatives)
+- [Alternatives](#alternatives-1)
 - [Infrastructure Needed (Optional)](#infrastructure-needed-optional)
 <!-- /toc -->
 
@@ -276,8 +280,8 @@ release for features to settle in as is typically needed for rollback support.
   - In alpha we intend to support:
     - `--emulation-version` range of `binaryMinorVersion`..`binaryMinorVersion-1`
   - In beta, we intend to extend support to:
-    - `--emulation-version` range of `binaryMinorVersion`..`binaryMinorVersion-1`
-    - `--min-compatibility-version` to `binaryMinorVersion`..`binaryMinorVersion-1`
+    - `--emulation-version` range of `binaryMinorVersion`..`binaryMinorVersion-3`
+    - `--min-compatibility-version` to `emulationVersion`..`binaryMinorVersion-3`
 
 ### Non-Goals
 
@@ -316,7 +320,8 @@ version be <= the kube-apiserver binary version, it must also be <= the
 
 #### --min-compatibility-version
 
-- Defaults to `binaryVersion-1` (matching current behavior)
+- Defaults to `emulationVersion-1` if `emulationVersion.GreaterThan(binaryVersion-3)` (matching current behavior in emulation mode), 
+and defaults to `emulationVersion` if `emulationVersion.EqualTo(binaryVersion-3)` (because of the max version range we are supporting) 
 - Must be <= `--emulation-version`
 - Must not be lower than the supported range of minor versions (see graduation
   criteria for ranges). If below the supported version range the binary will
@@ -338,7 +343,7 @@ rules be defined in terms of compatibility and emulation versions:
 
 - kubectl:
   - Previously: `1.{binaryMinorVersion-1}`..`{binaryVersion+1}`
-  - With this enhancement: `{minCompatibilityVersion-1}..{emulationVersion+1}`
+  - With this enhancement: `{minCompatibilityVersion}..{emulationVersion+1}`
 
 ### Changes to Feature Gates
 
@@ -562,6 +567,18 @@ func ClientFunction() {
 
 ```
 
+#### Non-Emulatable Features
+Generally, if a feature is enabled by default either in Beta or GA, it should be fairly stable already.
+In very rare cases for some default-off Beta features, a feature could be non-emulatable if the feature implementation history could not be preserved in the code base with reasonable maintenance cost.
+
+For these cases, we should try to emulate these changing features at best effort, and make sure the clients are aware of the risks of enabling default-off Beta features with emulation version.
+
+##### Alternatives
+An alternative would be to keep a exception list of `NonEmulatableFeatures`, and make the server fail to start if any of the `NonEmulatableFeatures` are enabled in compatibility mode. This approach has the benefits of predictable outcomes. The downsides are:
+1. whether a feature should be added to the list is subjective. It is hard to define a threshold to decide if the difficulty to preserve the implementation history is above this threshold, we could add the feature to the list.
+1. this could break automated upgrade processes using the emulation version, depending what features a cluster opts in.
+1. there needs proper cleaning up rules to ensure the list would not just keep growing.
+
 ### Validation ratcheting
 
 All validationg ratcheting needs to account for compatibility version.
@@ -599,18 +616,18 @@ for each API group. The StorageVersion changes across releases as API groups
 graduate through stability levels.
 
 During upgrades and downgrades, the storage version is particularly important.
-To enable upgrades and rollbacks, the version selected for storage in etcd in 
-version N must be (en/de)codable for k8s versions N-1 through N+1.
+To enable upgrades and rollbacks, pre compatibility version, the version selected for storage in etcd in 
+version N must be (en/de)codable for k8s versions N-1 through N+1. With compatibility version, the version selected for storage in etcd for the combination of `EmulationVersion` and `MinCompatibilityVersion` must be (en/de)codable for k8s versions `MinCompatibilityVersion` through `EmulationVersion+1`.
 
 Thus, to determine the storage version to use at compatibility version N, we 
-will find the set of all supported GVRs for each of N-1, N, and N+1 and intersect 
+will find the set of all supported GVRs for each version in the range of `MinCompatibilityVersion` and `EmulationVersion+1` and intersect 
 them to find a list of all GVRs supported by every binary version in the window. 
 The storage version of each group-resource is the newest 
 (using kube-aware version sorting) version found in that list for that group-resource.
 
 ### API availability
 
-Similar to feature flags, all APIs group-versions declarations will be modified
+By default, similar to feature flags, all APIs group-versions declarations will be modified
 to track which Kubernetes version the API group-versions are introduced (or
 removed) at.
 
@@ -624,6 +641,70 @@ to be able to turn on APIs exactly like it did for each Kubernetes version that
 emulation version can be set to.
 
 Alpha APIs may not be enabled in conjunction with emulation version.
+
+#### API availability in forward-compatible mode
+
+If we stick to the strict rule of api availability matching the emulation version, we would face some challenging scenarios when emulating the controllers when an API is graduating from Beta to GA and the controller wants to use newer API. For example, to graduate Multiple Service CIDRs to GA, normally the controller code change would look like:
+```diff
+- c.serviceCIDRInformer = networkingv1beta1informers.NewFilteredServiceCIDRInformer(client, 12*time.Hour,
++	c.serviceCIDRInformer = networkingv1informers.NewFilteredServiceCIDRInformer(client, 12*time.Hour,
+		cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc},
+		func(options *metav1.ListOptions) {
+			options.FieldSelector = fields.OneTermEqualSelector("metadata.name", DefaultServiceCIDRName).String()
+		})
+
+-	c.serviceCIDRLister = networkingv1beta1listers.NewServiceCIDRLister(c.serviceCIDRInformer.GetIndexer())
++	c.serviceCIDRLister = networkingv1listers.NewServiceCIDRLister(c.serviceCIDRInformer.GetIndexer())
+	c.serviceCIDRsSynced = c.serviceCIDRInformer.HasSynced
+
+	return c
+  //...
+
+type Controller struct {
+	eventRecorder    record.EventRecorder
+
+	serviceCIDRInformer cache.SharedIndexInformer
+-	serviceCIDRLister   networkingv1beta1listers.ServiceCIDRLister
++	serviceCIDRLister   networkingv1listers.ServiceCIDRLister
+	serviceCIDRsSynced  cache.InformerSynced
+
+```
+To fully emulate the controller for an older version, anywhere v1 api/type is referenced, it would need to switch to the v1beta version if the emulation version is older than the binary version. This would mean a lot of extra work, complicated testing rules, and high maintenance cost even for simple API graduations, while the emulation fidelity is unreliable with the extra complexity.
+
+So instead of truly emulating the feature controllers and API availability at the emulation version, we are allowing apis introduced after the emulation version to be enabled explicitly with `--runtime-config=api/<version>`. We are also introducing an umbrella `--emulation-forward-compatible` flag to enable forward compatibility of all APIs in compatibility version mode: if an older version of the API is enabled, newer and more stable versions of the same resource group introduced between the emulation version and binary version would also be enabled. This way the non-emulatable feature controllers would be able to use the newest available API. 
+
+For API availability, setting `--emulation-forward-compatible=true` means:
+1. if an API is removed (as indicated by the GVK prerelease lifecycle) after the emulation version, it would still be available at the emulation version (regardless of `--emulation-forward-compatible=true/false`). 
+1. if an API is Beta at the emulation version (meaning the Beta API has been introduced and has not been removed by the emulation version), it can be enabled by `--runtime-config=api/<version>` or it can be on-by-default at the emulation version. If a Beta API is enabled at the emulation version, and it has GAed between the emulation version and the binary version, its GA version(s) would also be enabled at the emulation version. If a newer Beta API is introduced between the emulation version and the binary version, the newer Beta API(s) would also be enabled at the emulation version.
+1. if a Beta API is not enabled at the emulation version, its future versions would not be enabled at the emulation version unless explicitly enabled with `--runtime-config=api/<version>`.
+1. If an API has GAed at the emulated version, it would be enabled by default at the emulation version. If a newer stable version of the GA API has been introduced between the emulation version and the binary version, the new GA API(s) would also be enabled at the emulation version along with the old GA API.
+1. Alpha APIs may not be enabled in conjunction with emulation version.
+
+Here are some examples for `BinaryVersion = 1.33`:
+API Prerelease Lifecycle | EmulationVersion | APIs Available @EmulationVersion 
+-----|-----|-----
+`v1alpha1: introduced=1.30, removed=1.31`<br>`v1beta1: introduced=1.31, removed=1.32`<br>`v1: introduced=1.32` | 1.30 | NA because we do not support emulating alpha apis.
+`v1alpha1: introduced=1.30, removed=1.31`<br>`v1beta1: introduced=1.31, removed=1.32`<br>`v1: introduced=1.32` | 1.31 | `api/v1beta1` available when `--runtime-config=api/v1beta1=true`<br>`api/v1beta1` and `api/v1` available only when `--runtime-config=api/v1beta1=true,api/v1=true` or `--runtime-config=api/v1beta1=true --emulation-forward-compatible=true`
+`v1alpha1: introduced=1.30, removed=1.31`<br>`v1beta1: introduced=1.31, removed=1.32`<br>`v1: introduced=1.32` | 1.33 | `api/v1`
+`v1beta1: introduced=1.31, removed=1.32`<br>`v1beta2: introduced=1.32` | 1.31 | `api/v1beta1` available when `--runtime-config=api/v1beta1=true`<br>`api/v1beta1` and `api/v1beta2` available only when `--runtime-config=api/v1beta1=true,api/v1beta2=true` or `--runtime-config=api/v1beta1=true --emulation-forward-compatible=true`
+`v1beta1: introduced=1.31, removed=1.32`<br>`v1beta2: introduced=1.32` | 1.33 | `api/v1beta2` available only when `--runtime-config=api/v1beta2=true`
+`v1: introduced=1.28`<br>`v2beta1: introduced=1.31, removed=1.32`<br>`v2: introduced=1.32` | 1.30 | `api/v1`<br>`api/v1`, `api/v2` when `--runtime-config=api/v2=true` or `--emulation-forward-compatible=true`
+`v1: introduced=1.28`<br>`v2beta1: introduced=1.31, removed=1.32`<br>`v2: introduced=1.32` | 1.31 | `api/v1`, `api/v2beta1` available when `--runtime-config=api/v2beta1=true`<br>`api/v1`, `api/v2beta1`, `api/v2` available only when `--runtime-config=api/v2beta1=true,api/v2=true` or `--runtime-config=api/v2beta1=true, --emulation-forward-compatible=true`
+`v1: introduced=1.28`<br>`v2beta1: introduced=1.31, removed=1.32`<br>`v2: introduced=1.32` | 1.33 | `api/v1`, `api/v2`
+
+For the controller, at the emulation version the controller is still enabled by enabling the Beta API **AND** the controller feature as before, but under the hood the controller is calling the newer API. 
+
+The forward compatibility of API availability should not affect data compatibility because storage version is still controlled by the `MinCompatibilityVersion` regardless of whether the data are created through future versions of the API endpoints. Webhooks should also work fine if the matching policy is `Equivalent`.
+
+For the use case of upgrading control plane binary version without changing the emulation version, this would mean api servers should be upgraded first before any other components, because an api server of the old binary version would not be able to serve a controller of the new binary version even though the emulation version is the same as the old binary version.
+
+#### Alternatives to API forward compatibility
+To make API graduation workable for controller code change under compatibility version, we have considered and rejected the following alternative options:
+1. `if .. else ..` statements everywhere is just impractical.
+1. have `v1Controller` and `v1beta1Controller` code in separate files would mean duplicate maintenance, test work, and developer churn.
+1. have some smart wrapper to pick the right version for each API/type reference: it is very hard to design a generic enough wrapper for all cases.
+1. convert the data to older version when the newer API is called: this is the essentially same as the enabling the newer API.
+1. have special mechanisms for controllers in `k/k` to call v1 apis, but not expose the v1 apis to clients: clients can spend efforts to duplicate the special mechanisms.
 
 ### API Field availability
 
@@ -831,9 +912,9 @@ Alpha feature graduated to Beta|off-by-default|on-by-default|feature enabled onl
 Beta feature graduated to GA|on-by-default|on|feature enabled unless `--feature-gates=<feature>=false`|feature always enabled, feature gate may not be set
 Beta feature removed|on-by-default|-|feature enabled unless `--feature-gates=<feature>=false`|feature does not exist
 Alpha API introduced|-|off-by-default|API does not exist|alpha APIs may not be used in conjunction with emulation version
-Beta API graduated to GA|off-by-default|on|API available only when `--runtime-config=api/v1beta1=true`|API `api/v1` available
-Beta API removed|off-by-default|-|API available only when `--runtime-config=api/v1beta1=true`|API `api/v1beta1` does not exist
-on-by-default Beta API removed|on-by-default|-|API available unless `--runtime-config=api/v1beta1=false`|API `api/v1beta1` does not exist
+Beta API graduated to GA|off-by-default|on|API `api/v1beta1` and `api/v1` available only when `--runtime-config=api/v1beta1=true`|API `api/v1` available
+Beta API removed|off-by-default|-|API `api/v1beta1` available only when `--runtime-config=api/v1beta1=true`|API `api/v1beta1` does not exist
+on-by-default Beta API removed|on-by-default|-|API `api/v1beta1` available unless `--runtime-config=api/v1beta1=false`|API `api/v1beta1` does not exist
 API Storage version changed|v1beta1|v1|Resources stored as v1beta1|Resources stored as v1
 new CEL function|-|function in StoredExpressions CEL environment|CEL function does not exist|Resources already containing CEL expression can be evaluated
 introduced CEL function|function in StoredExpressions CEL environment|function in NewExpressions CEL environment|Resources already containing CEL expression can be evaluated|CEL expression can be written to resources and can be evaluted from storage
@@ -876,9 +957,12 @@ We intend to have this up and running for Beta
 
 - Initial cross-branch e2e tests completed and enabled
 - Emulation version support for N-3 minor versions
-- Compatibility version support for N-3 minor versions
+- Min compatibility version support for N-3 minor versions
 - Clients send version number and servers report out-of-allowance skew to a metric
   (Leveraging work from KEP-4355 if possible)
+- All existing features migrated to versioned feature gate - [kubernetes #125031](https://github.com/kubernetes/kubernetes/issues/125031)
+- Verification machinery added - [kubernetes #125032](https://github.com/kubernetes/kubernetes/issues/125032) 
+- Integrate [test/featuregate_linter](https://github.com/kubernetes/kubernetes/blob/35488ef5c7212a3d491b86e02b1ba05dbbc4b894/test/featuregates_linter/README.md) into golangci-lint
 
 <!--
 **Note:** *Not required until targeted at a release.*

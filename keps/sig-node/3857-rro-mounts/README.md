@@ -140,20 +140,28 @@ checklist items _must_ be updated for the enhancement to be released.
 
 Items marked with (R) are required *prior to targeting to a milestone / release*.
 
-- [ ] (R) Enhancement issue in release milestone, which links to KEP dir in [kubernetes/enhancements] (not the initial KEP PR)
-- [ ] (R) KEP approvers have approved the KEP status as `implementable`
-- [ ] (R) Design details are appropriately documented
-- [ ] (R) Test plan is in place, giving consideration to SIG Architecture and SIG Testing input (including test refactors)
-  - [ ] e2e Tests for all Beta API Operations (endpoints)
-  - [ ] (R) Ensure GA e2e tests meet requirements for [Conformance Tests](https://github.com/kubernetes/community/blob/master/contributors/devel/sig-architecture/conformance-tests.md) 
-  - [ ] (R) Minimum Two Week Window for GA e2e tests to prove flake free
-- [ ] (R) Graduation criteria is in place
-  - [ ] (R) [all GA Endpoints](https://github.com/kubernetes/community/pull/1806) must be hit by [Conformance Tests](https://github.com/kubernetes/community/blob/master/contributors/devel/sig-architecture/conformance-tests.md) 
-- [ ] (R) Production readiness review completed
-- [ ] (R) Production readiness review approved
-- [ ] "Implementation History" section is up-to-date for milestone
-- [ ] User-facing documentation has been created in [kubernetes/website], for publication to [kubernetes.io]
-- [ ] Supporting documentation—e.g., additional design documents, links to mailing list discussions/SIG meetings, relevant PRs/issues, release notes
+- [X] (R) Enhancement issue in release milestone, which links to KEP dir in [kubernetes/enhancements] (not the initial KEP PR)
+- [X] (R) KEP approvers have approved the KEP status as `implementable`
+- [X] (R) Design details are appropriately documented
+- [X] (R) Test plan is in place, giving consideration to SIG Architecture and SIG Testing input (including test refactors)
+  - [X] e2e Tests for all Beta API Operations (endpoints)
+      - https://github.com/kubernetes/kubernetes/blob/v1.30.0/test/e2e_node/mount_rro_linux_test.go
+  - [X] (R) Ensure GA e2e tests meet requirements for [Conformance Tests](https://github.com/kubernetes/community/blob/master/contributors/devel/sig-architecture/conformance-tests.md) 
+    <!--
+    This is an optional feature which is "not currently eligible for conformance tests".
+    https://github.com/kubernetes/community/blob/e22cc42fba8078b8a7242a894d7fee9507ad92dc/contributors/devel/sig-architecture/conformance-tests.md?plain=1#L67
+
+    e2e_node tests have been passing.
+    -->
+  - [X] (R) Minimum Two Week Window for GA e2e tests to prove flake free
+- [X] (R) Graduation criteria is in place
+  - [X] (R) [all GA Endpoints](https://github.com/kubernetes/community/pull/1806) must be hit by [Conformance Tests](https://github.com/kubernetes/community/blob/master/contributors/devel/sig-architecture/conformance-tests.md) 
+    <!-- See the note above about the Conformance Tests -->
+- [X] (R) Production readiness review completed
+- [X] (R) Production readiness review approved <!-- 2024-06-13 https://github.com/kubernetes/enhancements/pull/4668#pullrequestreview-2113546630 -->
+- [X] "Implementation History" section is up-to-date for milestone
+- [X] User-facing documentation has been created in [kubernetes/website], for publication to [kubernetes.io]
+- [X] Supporting documentation—e.g., additional design documents, links to mailing list discussions/SIG meetings, relevant PRs/issues, release notes
 
 <!--
 **Note:** This checklist is iterative and should be reviewed and updated every time this enhancement is being considered for a milestone.
@@ -185,15 +193,8 @@ updates.
 [documentation style guide]: https://github.com/kubernetes/community/blob/master/contributors/guide/style-guide.md
 -->
 
-Utilize runc's "rro" bind mount option (https://github.com/opencontainers/runc/pull/3272)
-to make read-only bind mounts literally read-only.
-
-The "rro" bind mount options is implemented by calling [`mount_setattr(2)`](https://man7.org/linux/man-pages/man2/mount_setattr.2.html)
-with `MOUNT_ATTR_RDONLY` and `AT_RECURSIVE`.
-
-Requires kernel >= 5.12, with one of the following OCI runtimes:
-- runc >= 1.1
-- crun >= 1.4
+Make read-only volumes recursively read-only.
+e.g., if `/mnt` is mounted as read-only, its submounts such as `/mnt/usbstorage` should be read-only too.
 
 ## Motivation
 
@@ -208,6 +209,16 @@ demonstrate the interest in a KEP within the wider Kubernetes community.
 
 The current `readOnly` volumes are not recursively read-only, and may result in compromise of data;
 e.g., even if `/mnt` is mounted as read-only, its submounts such as `/mnt/usbstorage` are not read-only.
+
+This issue can be fixed by utilizing OCI Runtime's "rro" bind mount option (https://github.com/opencontainers/runtime-spec/blob/v1.2.0/config.md#linux-mount-options)
+to make read-only bind mounts recursively read-only.
+
+The "rro" bind mount options is implemented by calling [`mount_setattr(2)`](https://man7.org/linux/man-pages/man2/mount_setattr.2.html)
+with `MOUNT_ATTR_RDONLY` and `AT_RECURSIVE`.
+
+Requires kernel >= 5.12, with one of the following OCI runtimes:
+- runc >= 1.1
+- crun >= 1.4
 
 ### Goals
 
@@ -575,9 +586,15 @@ This can inform certain test coverage improvements that we want to do before
 extending the production code to implement this enhancement.
 -->
 
-- kubelet unit tests: will take a CRI status and populate the `VolumeMountStatus`.
+- kubelet unit tests: takes a CRI status and populate the `RecursiveReadOnly` field in the `VolumeMountStatus` struct.
+  Implemented in <https://github.com/kubernetes/kubernetes/blob/v1.30.0/pkg/kubelet/kubelet_pods_test.go#L6080-L6201>.
+  The unit test set covers 16 conditions as of Kubernetes v1.30.0.
+  Coverage:
+  - `k8s.io/kubernetes/pkg/kubelet`: [2025-02-11 - 70.7%](https://testgrid.k8s.io/sig-testing-canaries#ci-kubernetes-coverage-unit)
+
 - [CRI test](https://github.com/kubernetes-sigs/cri-tools):
-  will be similar to [e2e tests](#e2e-tests) below but without using Kubernetes Core API.
+  similar to [e2e tests](#e2e-tests) below but without using Kubernetes Core API.
+  Implemented in <https://github.com/kubernetes-sigs/cri-tools/blob/v1.30.0/pkg/validate/container_linux.go#L311-L413>.
 
 ##### Integration tests
 
@@ -622,6 +639,28 @@ We expect no non-infra related flakes in the last month as a GA graduation crite
 - run RecursiveReadOnly="Enabled" on a runtime that does not support it and ensure the error
 - run RecursiveReadOnly="Enabled", and verify that the mount is actually recursively read-only
 - run RecursiveReadOnly="Disabled", and verify that the mount is actually not recursively read-only
+
+The `e2e_node` tests are implemented in <https://github.com/kubernetes/kubernetes/blob/v1.30.0/test/e2e_node/mount_rro_linux_test.go>.
+
+Test grid:
+
+- [`containerd-node-e2e-features-1.7`](https://testgrid.k8s.io/sig-node-containerd#containerd-node-e2e-features-1.7)
+```
+E2eNode Suite.[It] [sig-node] Mount recursive read-only [LinuxOnly] [Feature:RecursiveReadOnlyMounts] Mount recursive read-only when the runtime does not support recursive read-only mounts should accept non-recursive read-only mounts
+E2eNode Suite.[It] [sig-node] Mount recursive read-only [LinuxOnly] [Feature:RecursiveReadOnlyMounts] Mount recursive read-only when the runtime does not support recursive read-only mounts should reject recursive read-only mounts
+```
+
+- [`ci-crio-cgroupv2-node-e2e-features`](https://testgrid.k8s.io/sig-node-cri-o#ci-crio-cgroupv2-node-e2e-features)
+```
+E2eNode Suite.[It] [sig-node] Mount recursive read-only [LinuxOnly] [Feature:RecursiveReadOnlyMounts] Mount recursive read-only when the runtime supports recursive read-only mounts should accept recursive read-only mounts
+E2eNode Suite.[It] [sig-node] Mount recursive read-only [LinuxOnly] [Feature:RecursiveReadOnlyMounts] Mount recursive read-only when the runtime supports recursive read-only mounts should reject invalid recursive read-only mounts
+```
+
+k8s-triage:
+- https://storage.googleapis.com/k8s-triage/index.html?sig=node&job=e2e&test=recursive%20read-only
+```
+0 clusters of 0 failures out of 127983 builds from 2025/1/28 9:00:38 to 2025/2/11 12:45:18.
+```
 
 ### Graduation Criteria
 
@@ -693,9 +732,14 @@ in back-to-back releases.
 
 #### Beta
 - e2e tests pass with containerd, CRI-O, and cri-dockerd
+ - https://github.com/containerd/containerd/pull/9787
+ - https://github.com/cri-o/cri-o/pull/7962
+ - https://github.com/Mirantis/cri-dockerd/pull/370
 
 #### GA
-- (Will be revisited during beta)
+- Two beta releases of Kubernetes at least
+- containerd (v2.0) and CRI-O (v1.30) support the feature with their GA releases.
+  The feature has been implemented in the `master` branch of cri-dockerd too.
 
 ### Upgrade / Downgrade Strategy
 
@@ -928,7 +972,13 @@ Describe manual testing that was done and the outcomes.
 Longer term, we may want to require automated upgrade/rollback tests, but we
 are missing a bunch of machinery and tooling and can't do that now.
 -->
-(Will be revisited during beta)
+
+During the beta phase, the following test will be manually performed:
+* Enable the `RecursiveReadOnly` feature gate for kube-apiserver and kubelet.
+* Create a pod with `recursiveReadOnly` specified.
+* Disable the `RecursiveReadOnly` feature gate for kube-apiserver, and confirm that the pod gets rejected.
+* Enable the `RecursiveReadOnly` feature gate again, and confirm that the pod gets scheduled again.
+* Do the same for kubelet too.
 
 ###### Is the rollout accompanied by any deprecations and/or removals of features, APIs, fields of API types, flags, etc.?
 
@@ -1240,6 +1290,9 @@ Major milestones might include:
 - the version of Kubernetes where the KEP graduated to general availability
 - when the KEP was retired or superseded
 -->
+- v1.30: alpha
+- v1.31: beta
+- v1.33: GA
 
 ## Drawbacks
 

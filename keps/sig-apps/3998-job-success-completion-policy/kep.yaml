@@ -17,19 +17,22 @@ approvers:
   - "@wojtek-t"
   - "@soltysh"
 
+see-also:
+  - "/keps/sig-apps/4368-support-managed-by-batch-job"
+
 # The target maturity stage in the current dev cycle for this KEP.
-stage: alpha
+stage: stable
 
 # The most recent milestone for which work toward delivery of this KEP has been
 # done. This can be the current (upcoming) milestone, if it is being actively
 # worked on.
-latest-milestone: "v1.30"
+latest-milestone: "v1.33"
 
 # The milestone at which this feature was, or is targeted to be, at each stage.
 milestone:
   alpha: "v1.30"
-  beta:
-  stable:
+  beta: "v1.31"
+  stable: "v1.33"
 
 # The following PRR answers are required at alpha release
 # List the feature gate name and the components for which it must be enabled
@@ -42,3 +45,5 @@ disable-supported: true
 
 # The following PRR answers are required at beta release
 metrics:
+  - job_sync_duration_seconds
+  - jobs_finished_total

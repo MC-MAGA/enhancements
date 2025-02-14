@@ -5,7 +5,7 @@ authors:
 owning-sig: sig-scheduling
 participating-sigs:
   - sig-autoscaling
-status: implementable
+status: implemented
 creation-date: 2021-10-28
 reviewers:
   - "@alculquicondor"
@@ -24,4 +24,5 @@ disable-supported: false
 feature-gates:
   - name: MinDomainsInPodTopologySpread
     components:
+      - kube-apiserver
       - kube-scheduler
