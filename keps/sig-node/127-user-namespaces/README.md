@@ -7,13 +7,13 @@
   - [Goals](#goals)
   - [Non-Goals](#non-goals)
 - [Proposal](#proposal)
-  - [User Stories](#user-stories)
+  - [User Stories (Optional)](#user-stories-optional)
     - [Story 1](#story-1)
     - [Story 2](#story-2)
     - [Story 3](#story-3)
     - [Story 4](#story-4)
     - [Story 5](#story-5)
-  - [Notes/Constraints/Caveats](#notesconstraintscaveats)
+  - [Notes/Constraints/Caveats (Optional)](#notesconstraintscaveats-optional)
   - [Risks and Mitigations](#risks-and-mitigations)
 - [Design Details](#design-details)
   - [Pod.spec changes](#podspec-changes)
@@ -27,7 +27,6 @@
     - [Regarding the previous implementation for volumes](#regarding-the-previous-implementation-for-volumes)
   - [Pod Security Standards (PSS) integration](#pod-security-standards-pss-integration)
   - [Unresolved](#unresolved)
-    - [Pod Security Standards (PSS)](#pod-security-standards-pss)
   - [Test Plan](#test-plan)
       - [Prerequisite testing updates](#prerequisite-testing-updates)
       - [Unit tests](#unit-tests)
@@ -65,13 +64,17 @@ Items marked with (R) are required *prior to targeting to a milestone / release*
 - [X] (R) Enhancement issue in release milestone, which links to KEP dir in [kubernetes/enhancements] (not the initial KEP PR)
 - [X] (R) KEP approvers have approved the KEP status as `implementable`
 - [X] (R) Design details are appropriately documented
-- [X] (R) Test plan is in place, giving consideration to SIG Architecture and SIG Testing input
+- [X] (R) Test plan is in place, giving consideration to SIG Architecture and SIG Testing input (including test refactors)
+  - [X] e2e Tests for all Beta API Operations (endpoints)
+  - [ ] (R) Ensure GA e2e tests meet requirements for [Conformance Tests](https://github.com/kubernetes/community/blob/master/contributors/devel/sig-architecture/conformance-tests.md) 
+  - [ ] (R) Minimum Two Week Window for GA e2e tests to prove flake free
 - [X] (R) Graduation criteria is in place
+  - [ ] (R) [all GA Endpoints](https://github.com/kubernetes/community/pull/1806) must be hit by [Conformance Tests](https://github.com/kubernetes/community/blob/master/contributors/devel/sig-architecture/conformance-tests.md) 
 - [X] (R) Production readiness review completed
-- [X] Production readiness review approved
+- [X] (R) Production readiness review approved
 - [X] "Implementation History" section is up-to-date for milestone
-- [ ] User-facing documentation has been created in [kubernetes/website], for publication to [kubernetes.io]
-- [ ] Supporting documentation—e.g., additional design documents, links to mailing list discussions/SIG meetings, relevant PRs/issues, release notes
+- [X] User-facing documentation has been created in [kubernetes/website], for publication to [kubernetes.io]
+- [X] Supporting documentation—e.g., additional design documents, links to mailing list discussions/SIG meetings, relevant PRs/issues, release notes
 
 [kubernetes.io]: https://kubernetes.io/
 [kubernetes/enhancements]: https://git.k8s.io/enhancements
@@ -157,7 +160,7 @@ This proposal aims to support running pods inside user namespaces.
 
 This mitigates all the vulnerabilities listed in the motivation section.
 
-### User Stories
+### User Stories (Optional)
 
 #### Story 1
 
@@ -191,9 +194,20 @@ As a cluster admin, I want to use different host UIDs/GIDs for pods running on
 the same node (whenever kernel/kube features allow it), so I can mitigate the
 impact a compromised pod can have on other pods and the node itself.
 
-### Notes/Constraints/Caveats
+### Notes/Constraints/Caveats (Optional)
 
 ### Risks and Mitigations
+
+An error in user namespaces manager can result in the kubelet failing
+initialization. We will mitigate this by having extensive unit tests to test the
+case of the feature gate disabled and enabled. We will also add e2e tests to
+verify the kubelet works as expected when the feature is enabled (DONE).
+
+The KEP needs changes in the CRI interface, high-level container runtimes
+(containerd, cri-o), low-level container runtimes (runc, crun) and the Linux
+kernel. To mitigate possible issues with the interaction of the components
+involved, we will write integration tests in k8s, containerd, cri-o, runc, crun,
+cri-tools and xfstests for the Linux bits. (DONE)
 
 ## Design Details
 
@@ -336,6 +350,8 @@ bool `pod.spec.hostUsers`.
 The mapping length will be 65536, mapping the range 0-65535 to the pod. This wide
 range makes sure most workloads will work fine. Additionally, we don't need to
 worry about fragmentation of IDs, as all pods will use the same length.
+The mapping length (multiple of 65536) will be customizable via a new
+`KubeletConfiguration` property `subidsPerPod`.
 
 The mapping will be chosen by the kubelet, using a simple algorithm to give
 different pods in this category ("without" volumes) a non-overlapping mapping.
@@ -464,27 +480,24 @@ components that implement the interface.
 
 [Pod Security Standards](https://k8s.io/docs/concepts/security/pod-security-standards)
 define three different policies to broadly cover the whole security spectrum of
-Kubernetes, while the User Namespaces feature should integrate into them. This
-will happen only if the feature is graduated to GA, which _may_ result in
-changing the `Restricted` profile to disallow host user namespaces for stateless
-Pods.
+Kubernetes, while the User Namespaces feature should integrate into them.
 
 The Pod Security will relax in a controlled way for pods which enable user
 namespaces. This behavior can be controlled by an API Server Feature Gate, which
 allows an early opt-in for end users. The overall burden to ensure that all
-nodes will honor user namespaces is on the cluster admin, though. The relaxation
-in detail means, that if user namespaces are enabled, then the following fields
-won't be restricted any more because they always have to refer to the user
-inside the container:
+nodes will honor user namespaces is on the cluster admin, though.
 
-- `spec.securityContext.runAsNonRoot`
-- `spec.containers[*].securityContext.runAsNonRoot`
-- `spec.initContainers[*].securityContext.runAsNonRoot`
-- `spec.ephemeralContainers[*].securityContext.runAsNonRoot`
-- `spec.securityContext.runAsUser`
-- `spec.containers[*].securityContext.runAsUser`
-- `spec.initContainers[*].securityContext.runAsUser`
-- `spec.ephemeralContainers[*].securityContext.runAsUser`
+For `baseline` and `restricted` namespaces, if a pod has `hostUsers` set to false, then the fields `runAsNonRoot` can be set to false and
+`runAsUser` and `runAsGroup` can be set to any value for any `securityContext` in the pod (pod, container, initContainer, ephemeralContainer).
+
+For `baseline` namespaces, pods with `hostUsers` set to false can set any value for the `capabilities.add` field,
+whereas normally in a `baseline` namespace a pod is restricted to adding certain capabilities.
+
+The validation for capabilities can be relaxed in a `baseline` pod because capabilities
+are user namespaced in the linux kernel, and any pod does not have a seccomp profile (as baseline
+pods may not be required to, depending on the kubelet's `seccompDefault` configuration field)
+has access to the `unshare` syscall, allowing a user to create a user
+namespace in the pod, and gain the full set of capabilities within a user namespace.
 
 A serial test will be added to validate the functionality with the enabled
 feature gate.
@@ -510,24 +523,6 @@ something else to this list:
   allows). Same applies for VM runtimes.
   UPDATE: Windows maintainers reviewed and [this change looks good to them][windows-review].
 
-#### Pod Security Standards (PSS)
-
-The following security context fields have not been relaxed with respect to PSS
-because of [raised security concerns](https://github.com/kubernetes/kubernetes/pull/118760#discussion_r1373287637):
-
-- `spec.containers[*].securityContext.allowPrivilegeEscalation`
-- `spec.initContainers[*].securityContext.allowPrivilegeEscalation`
-- `spec.ephemeralContainers[*].securityContext.allowPrivilegeEscalation`
-- `spec.containers[*].securityContext.capabilities.drop`
-- `spec.initContainers[*].securityContext.capabilities.drop`
-- `spec.ephemeralContainers[*].securityContext.capabilities.drop`
-- `spec.containers[*].securityContext.capabilities.add`
-- `spec.initContainers[*].securityContext.capabilities.add`
-- `spec.ephemeralContainers[*].securityContext.capabilities.add`
-
-Further investigations will be done in future Kubernetes releases to revisit
-them.
-
 ### Test Plan
 
 <!--
@@ -551,6 +546,7 @@ to implement this enhancement.
 Based on reviewers feedback describe what additional tests need to be added prior
 implementing this enhancement to ensure the enhancements have also solid foundations.
 -->
+None.
 
 ##### Unit tests
 
@@ -701,7 +697,11 @@ pod.spec.hostUsers and has the feature gate enabled.
 If the kube-apiserver doesn't support the feature at all (< 1.25), the unknown field will be dropped and
 the pod will be created without a userns.
 
-If the kubelet doesn't support the feature (< 1.25), it will ignore the pod.spec.hostUsers field.
+If the kubelet doesn't support the feature (< 1.25), or the feature is off, it will ignore the pod.spec.hostUsers field.
+In 1.30, the kubelet began failing to create a pod if the feature is off but hostUsers: false is specified.
+
+Thus, 1.33 is the first release the kube-apiserver can reliably assume a pod with a user namespace specified is either
+created with a user namespace, or fails to create, no matter feature gate skew.
 
 #### Kubelet and container runtime skews
 
@@ -1389,12 +1389,33 @@ For each of them, fill in the following information by copying the below templat
 
 ###### What steps should be taken if SLOs are not being met to determine the problem?
 
+This KEP doesn't introduce new SLOs and doesn't result in increasing time taken
+by Kubernetes components.
+
+As explained in "Will enabling / using this feature result in increasing time
+taken by any operations covered by existing SLIs/SLOs?" if the container runtime
+wants to support this in older kernels, it can have an impact on this SLO:
+
+> Startup latency of schedulable pods, excluding time to pull images and run init containers, measured from pod creation timestamp to when all its containers are reported as started and observed via watch, measured as 99th percentile over last 5 minutes
+
+At the time of writing, no container runtime supports user namespaces with old
+kernels, so no container runtime is affected. There is no plan to support that
+scenario either, at the time of writing.
+
+However, if a container runtime supports userns with old kernels in the future,
+to determine if user namespaces are affecting the SLO it should be tested if
+pods without the pod.spec.hostUsers line are also affected. If they are not
+affected (IOW, pods without using user namespaces), then user namespaces seem to
+be the cause of the problem.
+
 ## Implementation History
 
 - 2016: First iterations of this KEP, but code never landed upstream.
 - Kubernetes 1.25: Support for stateless pods merged (alpha)
 - Kubernetes 1.27: Support for stateless pods rework to rely on idmap mounts (alpha)
 - Kubernetes 1.28: Support for stateful pods, renamed feature gate (alpha)
+- Kubernetes 1.30: Feature went off-by-default beta
+- Kubernetes 1.33: Feature goes on-by-default beta
 
 <!--
 Major milestones in the lifecycle of a KEP should be tracked in this section.

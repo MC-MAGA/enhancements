@@ -94,8 +94,8 @@ tags, and then generate with `hack/update-toc.sh`.
   - [Proposal: New <code>RemoteCommand</code> Sub-Protocol Version - <code>v5.channel.k8s.io</code>](#proposal-new-remotecommand-sub-protocol-version---v5channelk8sio)
   - [Proposal: API Server RemoteCommand <code>StreamTranslatorProxy</code>](#proposal-api-server-remotecommand-streamtranslatorproxy)
   - [Background: <code>PortForward</code> Subprotocol](#background-portforward-subprotocol)
-  - [Proposal: New <code>PortForward</code> Subprotocol Version - <code>v2.portforward.k8s.io</code>](#proposal-new-portforward-subprotocol-version---v2portforwardk8sio)
-  - [Proposal: API Server PortForward <code>StreamTranslatorProxy</code>](#proposal-api-server-portforward-streamtranslatorproxy)
+  - [Proposal: New <code>PortForward</code> Tunneling Subprotocol Version - <code>v2.portforward.k8s.io</code>](#proposal-new-portforward-tunneling-subprotocol-version---v2portforwardk8sio)
+  - [Proposal: API Server PortForward -- Stream Tunnel Proxy](#proposal-api-server-portforward----stream-tunnel-proxy)
   - [Pre-GA: Kubelet <code>StreamTranslatorProxy</code>](#pre-ga-kubelet-streamtranslatorproxy)
   - [Test Plan](#test-plan)
       - [Prerequisite testing updates](#prerequisite-testing-updates)
@@ -262,7 +262,7 @@ Currently, the bi-directional streaming protocols (either SPDY or WebSockets) ar
 initiated from clients, proxied by the API Server and Kubelet, and terminated at
 the Container Runtime (e.g. containerd or CRI-O). This enhancement proposes to 1)
 modify `kubectl` to request a WebSocket based streaming connection, and to 2) modify
-the current API Server proxy to translate the `kubectl` WebSockets data stream to
+the current API Server proxy to translate or tunnel the `kubectl` WebSockets data stream to
 a SPDY upstream connection. In this way, the cluster components upstream from the
 API Server will not initially need to be changed. We intend to extend the communication
 path for WebSockets streaming from `kubectl` to Kubelet once the the initial leg
@@ -316,22 +316,6 @@ A possible security vulnerability might occur when a potential upgraded connecti
 is redirected to other API endpoints.
 
   - Mitigation: Upgraded connections are disallowed from redirecting.
-
-- Risk: Overloaded Concurrency
-
-PortForward subrequests (e.g. `curl http://localhost:8080/index.html` after the connection
-upgrade) can occur concurrently over the the upgraded streaming connection, and these
-subrequests can be long-lasting. Each of these subrequests creates two streams (an
-error stream and a data stream) over the connection, and there are four goroutines spawned
-to service this subrequest and its associated streams. After the completion of the
-subrequest, the associated resources are reclaimed.
-
-  - Mitigation: Throttling the number of concurrent subrequests will limit the
-    number of concurrent streams and the number of concurrent goroutines on the
-    API Server. This throttling will ensure the server does not get overloaded.
-    If we need to the reduce number of concurrent goroutines even further we can
-	explore goroutine pools so that the number of goroutines will grow sublinearly
-	with the number of subrequests and streams.
 
 - Risk: Performance
 
@@ -505,83 +489,26 @@ $ curl http://localhost:8080/index.html
 The nginx HTTP response is returned over the same data stream. Once the subrequest is
 complete, both streams are closed and removed.
 
-### Proposal: New `PortForward` Subprotocol Version - `v2.portforward.k8s.io`
+### Proposal: New `PortForward` Tunneling Subprotocol Version - `v2.portforward.k8s.io`
 
-In order to implement `PortForward` over WebSockets, we propose the client attempt to
-upgrade the connection to WebSockets with a new `v2.portforward.k8s.io` subprotocol
-version. This new version will implement stream functionality over WebSockets
-which currently exists in SPDY but not WebSockets. Specifically, the WebSockets streams
-will implement:
+We propose a new PortForward version `v2.portforward.k8s.io`, which identifies upgrade
+requests which require tunneling. PortForward tunneling transparently encodes and
+decodes SPDY framed messages into (and out of) the payload of a WebSocket message.
+This tunneling is implemented on the client by substituting a WebSocket connection
+(which implements the `net.Conn` interface) into the constructor of a SPDY client.
+The SPDY client reads and writes its messages into and out of this connection. These
+SPDY messages are then encoded or decoded into and out of the WebSocket message payload.
 
-1. StreamCreate signal: A signal to the other WebSockets endpoint that a
-stream has been created. This communication will also contain the headers used to
-create the stream.
-2. StreamClose signal: A signal to the other WebSockets endpoint that the stream
-has been half-closed, and will not allow any further writing on the stream from
-the closed end.
-3. Larger stream identifier space: In order to accommodate numerous concurrent
-streams from many posssible portforward subrequests, we will need a large stream
-identifier space. It appears that SPDY implements 2^31 possible stream identifiers
-and we will provide four bytes for the WebSockets stream identifier to match SPDY.
-The size of these four bytes should not be material, since the size of the
-WebSockets buffer is much larger (32KB). But if we need to reduce the size of
-the stream identifier, we can use a `varint` instead of a `uint32`.
+### Proposal: API Server PortForward -- Stream Tunnel Proxy
 
-The WebSockets stream functionality will be implemented by encoding and decoding
-stream headers within the WebSockets data message. The stream header struct will
-look like:
-```
-// wsStreamHeader contains the data at the beginning of a websocket binary message.
-type wsStreamHeader struct {
-	MessageType byte   // Create, Close, or Data
-	StreamID    uint32 // or varint if we need to optimize
-    // Headers are only included in a Create message type. Well-known keys are:
-	// 1. StreamType: DataStream or ErrorStream.
-	// 2. RequestID: A unique identifier for the subrequest.
-	// 3. Port: The remote port the stream is forwarding data to.
-    Headers     http.Header
-}
-```
-
-### Proposal: API Server PortForward `StreamTranslatorProxy`
-
-![PortForward Stream Translator Proxy](./portforward-stream-translator-proxy.png)
-
-Updated steps detailing **requests** and **subrequests** for the proposed `StreamTranslatorProxy`.
-
-1. `kubectl port-forward` makes a **request** to the API Server to upgrade to a WebSockets
-streaming connection. At the API Server, the WebSockets connection is upgraded and terminated,
-while a legacy SPDY connection is created upstream to the container runtime.
-2. An arbitrary number of subsequent (and possibly concurrent) client **subrequests** can be made over
-this previously established WebSockets connection. Example: `curl http://localhost:8080/index.html`.
-3. Each of these **subrequests** creates two streams over the connection (a uni-directional
-error stream and a bi-directional data stream) between the client and the API Server.
-4. The API Server in turn creates a one-to-one correspondence between the WebSockets streams
-and upstream SPDY streams. The WebSocket streams are connected to SPDY streams by goroutines
-copying data between them. So each **subrequest** spawns four goroutines to service the two
-streams (one for the **subrequest** itself, as well as three to copy stream data in each
-direction).
-5. All the resources associated with the **subrequest** are reclaimed once the **subrequest**
-is completed.
-
-Similar to `RemoteCommand`, `PortForward` will also have a `StreamTranslatorProxy`
-within the API server to route data from WebSocket streams onto upstream, legacy
-SPDY streams. The new portforward `StreamTranslatorProxy` will handle requests
-for WebSockets connection upgrades with a `v2.portforward.k8s.io` header. The
-portforward `StreamTranslatorProxy` will initially attempt to create an upstream
-SPDY connection to the Kubelet using the legacy `v1.portforward.k8s.io` header.
-If successful, the `StreamTranslatorProxy` will create a server-side WebSockets
-connection, returning `101 Switching Protocols` to the WebSockets client. The
-server-side WebSockets connection will handle the `StreamCreate` and `StreamClose`
-signals, as well as de-multiplexing WebSocket streams using the passed stream
-identifier. Upon receiving a `StreamCreate` signal on the server-side of the
-WebSockets connection, a WebSocket stream will be created and queued onto a
-stream create channel. On the other end of the channel, the `StreamTranslatorProxy`
-will create a SPDY stream to associate with the WebSockets stream, using headers
-from the WebSockets stream. And if both portforward request streams have been
-created (data and error), then streaming will commence between the WebSockets
-and SPDY streams. Upon completion, the streams will be closed and removed. The
-`StreamClose` signal will be used to determine if the streaming has completed.
+At the API Server, tunneling is implemented by sending different parameters into the
+`UpgradeAwareProxy`. If the new subprotocol version `v2.portforward.k8s.io` is requested,
+the `UpgradeAwareProxy` is called with a new `tunnelingResponseWriter`. This `ResponseWriter`
+contains a tunneling WebSocket connection, which is returned when the connection is
+hijacked. And this tunneling WebSocket connection encodes and decodes SPDY messages
+as the downstream connection within the dual concurrent `io.Copy` proxying goroutines.
+The upstream connection is the same SPDY connection to the container (through the
+Kubelet and CRI).
 
 ### Pre-GA: Kubelet `StreamTranslatorProxy`
 
@@ -648,13 +575,16 @@ extending the production code to implement this enhancement.
 The following packages (including current test coverage) will be modified to implement
 this SDPY to WebSockets migration.
 
+- `k8s.io/kubernetes/staging/src/k8s.io/client-go/tools/portforward`: `2024-05-27` - `86.3%`
 - `k8s.io/kubernetes/staging/src/k8s.io/client-go/tools/remotecommand`: `2023-05-31` - `57.3%`
 - `k8s.io/kubernetes/staging/src/k8s.io/client-go/transport`: `2023-05-31` - `57.7%`
 - `k8s.io/kubernetes/staging/src/k8s.io/apimachinery/pkg/util/httpstream`: `2023-05-31` - `76.7%`
 - `k8s.io/kubernetes/staging/src/k8s.io/apimachinery/pkg/util/proxy`: `2023-05-31` - `59.1%`
+- `k8s.io/kubernetes/staging/src/k8s.io/apiserver/pkg/util/proxy`: `2024-05-27` - `81.5%`
 - `k8s.io/kubernetes/staging/src/k8s.io/kubectl/pkg/cmd/attach`: `2023-06-05` - `43.4%`
 - `k8s.io/kubernetes/staging/src/k8s.io/kubectl/pkg/cmd/cp`: `2023-06-05` - `66.3%`
 - `k8s.io/kubernetes/staging/src/k8s.io/kubectl/pkg/cmd/exec`: `2023-06-05` - `70.0%`
+- `k8s.io/kubernetes/staging/src/k8s.io/kubectl/pkg/cmd/portforward`: `2024-05-27` - `74.7%`
 
 An important set of tests for this migration will be **loopback** tests, which exercise the
 WebSocket client and the StreamTranslator proxy. These tests create two test servers: a
@@ -690,8 +620,7 @@ https://storage.googleapis.com/k8s-triage/index.html
 
 -->
 
-No integration tests are planned for alpha. Previously mentioned unit tests and current
-e2e tests provide sufficient.
+`PortForward: https://github.com/kubernetes/kubernetes/blob/master/test/integration/apiserver/portforward/portforward_test.go`
 
 ##### e2e tests
 
@@ -707,7 +636,7 @@ We expect no non-infra related flakes in the last month as a GA graduation crite
 - `<test>: <link to test coverage>`
 -->
 
-While there are already numerous current e2e tests for `kubectl exec, cp, attach`,
+While there are already numerous current e2e tests for `kubectl exec, cp, attach, and port-forward`,
 we will enhance these tests with the permutations of the feature flags for `kubectl`
 and the API Server. We will add e2e test coverage for flags and arguments that are
 not already covered for these commands.
@@ -797,9 +726,9 @@ in back-to-back releases.
   `kubectl port-forward` behind the `kubectl`  environment variable KUBECTL_PORT_FORWARD_WEBSOCKETS
   which is **OFF** by default.
 - FallbackDialer is completed and functional behind the `kubectl` environment variable
-  KUBECTL_PORT_FORWARD which if **OFF** by default. The FallbackDialer executes legacy
+  KUBECTL_PORT_FORWARD which is **OFF** by default. The FallbackDialer executes legacy
   SPDY `port-forward` if the server does not support the new WebSockets functionality.
-- PortForward `StreamTranslatorProxy` successfully added and integrated, living
+- PortForward `StreamTunnelingProxy` successfully added and integrated, living
   behind the API Server feature flag `PortForwardWebsockets` which is **OFF** by default.
 
 #### Beta
@@ -812,12 +741,21 @@ in back-to-back releases.
 
 ##### v1.31 PortForward Subprotocol (port-forward)
 
+- `kubectl port-forward` is behind the `kubectl`  environment variable KUBECTL_PORT_FORWARD_WEBSOCKETS
+  which is **ON** by default.
+- FallbackDialer is completed and functional behind the `kubectl` environment variable
+  KUBECTL_PORT_FORWARD which is **ON** by default. The FallbackDialer executes legacy
+  SPDY `port-forward` if the server does not support the new WebSockets functionality.
+- PortForward `StreamTunnelingProxy` successfully added and integrated, living
+  behind the API Server feature flag `PortForwardWebsockets` which is **ON** by default.
 - Additional `port-forward` unit tests completed and enabled.
 - Additional `port-forward` integration tests completed and enabled.
 - Additional `port-forward` e2e tests completed and enabled.
 
 #### GA
 
+- Add WebSocket support for HTTPS proxies.
+  - See (https://github.com/kubernetes/kubernetes/issues/126134)
 - Conformance tests for `RemoteCommand` completed and enabled.
 - Conformance tests for `RemoteCommand` have been stable and
   non-flaky for two weeks.
@@ -882,7 +820,7 @@ just as it has for the last several years.
 #### PortForward Subprotocol
 
 1. A newer WebSockets enabled `kubectl` communicating with an older API Server that
-does not support the newer PortForward `StreamTranslator` proxy.
+does not support the newer PortForward `StreamTunneling` proxy.
 
 In this case, the initial upgrade request for `PortForward` WebSockets will
 fail, because the `WebSockets` upgrade request `v2.portforward.k8s.io` will be proxied
@@ -892,7 +830,7 @@ legacy SPDY `v1.portforward.k8s.io`. In this fallback case, the PortForward stre
 functionality in this case will work exactly as it has for the last several years.
 
 2. A legacy non-WebSockets enabled `kubectl` communicating with a newer API Server that
-supports the newer PortForward `StreamTranslator` proxy.
+supports the newer PortForward `StreamTunneling` proxy.
 
 The `kubectl port-forward` will successfully request an upgrade for legacy
 `SPDY/PortForward - V1`, just as it has for the last several years.
@@ -900,11 +838,11 @@ The `kubectl port-forward` will successfully request an upgrade for legacy
 #### Version Skew within the Control Plane and Nodes
 
 These proposals do not modify intra-cluster version skew behavior. The entire reason
-for the current `StreamTranslatorProxy` design is to ensure no modifications
-to communication within the Control Plane. The `StreamTranslatorProxy` can update
+for the current `StreamTranslatorProxy` and `StreamTunnelingProxy` design is to ensure no modifications
+to communication within the Control Plane. The `StreamTranslatorProxy` or `StreamTunnelingProxy` can update
 streaming between the client and the API Server, but it is designed to provide legacy
 SPDY streaming from the API Server to the other components within the ControlPlane.
-Once this `StreamTranslatorProxy` is moved to the kubelet, we will have to address
+Once these `StreamTranslatorProxy` and `StreamTunnelingProxy` are moved to the kubelet, we will have to address
 the possibility of intra-cluster version skew.
 
 ## Production Readiness Review Questionnaire
@@ -974,10 +912,6 @@ KUBECTL_PORT_FORWARD_WEBSOCKETS environment variable must be set to **ON** for
 user unless the `kubectl`/API Server communication is communicating through an
 intermediary such as a proxy (which is the whole reason for the feature).
 
-**NOTE** These two sets of feature flags are currently at different maturity levels.
-As of v1.30, `RemoteCommand` feature flags are **enabled** by default (Beta), while
-`PortFoward` features flags are **disabled** by default (Alpha).
-
 ###### Can the feature be disabled once it has been enabled (i.e. can we roll back the enablement)?
 
 <!--
@@ -1016,9 +950,13 @@ https://github.com/kubernetes/kubernetes/pull/97058/files#diff-7826f7adbc1996a05
 -->
 
 - There will be unit tests for the `kubectl` environment variable KUBECTL_REMOTE_COMMAND_WEBSOCKETS.
+- There are unit tests for the `kubectl` environment variable KUBECTL_PORT_FORWARD_WEBSOCKETS.
 - There will be unit tests in the API Server which exercise the feature gate within
   the `UpgradeAwareProxy`, which conditionally delegates to the `StreamTranslator`
   proxy (depending on the feature gate and the upgrade parameters).
+- There are unit tests in the API Server which exercise the feature gate within
+  the `UpgradeAwareProxy`, which conditionally delegates to the `StreamTunneling`
+  proxy for the PortForward subprotocol.
 
 ### Rollout, Upgrade and Rollback Planning
 
@@ -1516,6 +1454,7 @@ Major milestones might include:
 - RemoteCommand over WebSockets shipped as beta: v1.30
 - First Kubernetes release where PortForward over WebSockets described in KEP: v1.30
 - PortForward over WebSockets shipped as alpha: v1.30
+- PortForward over WebSockets shipped as beta: v1.31
 
 ## Drawbacks
 
